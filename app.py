@@ -26,8 +26,7 @@ TOLERANCIA_X_FAIXA = 6
 PERCENTUAL_PRATICA = 0.35
 PERCENTUAL_TEORICA = 0.65
 
-MODELO_PRINCIPAL = "openai/gpt-oss-120b"
-MODELO_FALLBACK = "qwen/qwen3.6-27b"
+MODELO_IA = "openai/gpt-oss-120b"
 
 # ==========================================
 # .ENV / SECRETS / CLIENTE IA
@@ -511,31 +510,6 @@ def chamar_ia_com_retry(**kwargs):
             time.sleep(espera)
     raise ultima_excecao
 
-def chamar_ia_com_fallback(messages, temperature=0.2, max_tokens=8000, response_format=None):
-    erros = []
-    modelos = [MODELO_PRINCIPAL, MODELO_FALLBACK]
-
-    for modelo in modelos:
-        try:
-            kwargs = {
-                "model": modelo,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-
-            if response_format is not None:
-                kwargs["response_format"] = response_format
-
-            return chamar_ia_com_retry(**kwargs)
-
-        except Exception as e:
-            erros.append(f"{modelo}: {str(e)}")
-
-    raise RuntimeError(
-        "Falha ao chamar os modelos disponíveis. Detalhes: " + " | ".join(erros)
-    )
-
 def validar_estrutura_aulas(aulas: List[Dict[str, Any]]) -> None:
     if not isinstance(aulas, list) or not aulas:
         raise ValueError("A IA não retornou uma lista válida de aulas.")
@@ -578,7 +552,8 @@ Lista oficial:
 {texto_conhecimentos}
 """
 
-    completion = chamar_ia_com_fallback(
+    completion = chamar_ia_com_retry(
+        model=MODELO_IA,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
         max_tokens=8000,
@@ -862,7 +837,8 @@ def processar_arquivos(pdf_bytes: bytes, excel_bytes: bytes) -> Dict[str, Any]:
             "carga_horaria": carga_horaria,
             "numero_aulas": numero_aulas,
             "aulas": aulas_estruturadas,
-            "arquivo_saida": arquivo_saida
+            "arquivo_saida": arquivo_saida,
+            "modelo_usado": MODELO_IA
         }
 
     finally:
@@ -897,6 +873,7 @@ if st.button("🚀 Gerar PER preenchido"):
             st.subheader("Resumo")
             st.write(f"**Carga horária identificada:** {resultado['carga_horaria']} horas")
             st.write(f"**Número de aulas:** {resultado['numero_aulas']}")
+            st.write(f"**Modelo usado:** {resultado['modelo_usado']}")
 
             with st.expander("Tópicos extraídos"):
                 for i, topico in enumerate(resultado["conhecimentos"], start=1):
