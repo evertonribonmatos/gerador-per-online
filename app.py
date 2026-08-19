@@ -27,6 +27,7 @@ PERCENTUAL_PRATICA = 0.35
 PERCENTUAL_TEORICA = 0.65
 
 MODELO_IA = "openai/gpt-oss-120b"
+MAX_TOKENS_AULA = 500
 
 # ==========================================
 # .ENV / SECRETS / CLIENTE IA
@@ -506,188 +507,113 @@ def chamar_ia_com_retry(**kwargs):
             return client.chat.completions.create(**kwargs)
         except Exception as e:
             ultima_excecao = e
+            msg = str(e).lower()
+
+            if "request too large" in msg or "rate_limit_exceeded" in msg:
+                raise ValueError(
+                    "A requisição excedeu o limite de tokens da conta/modelo. "
+                    "Reduza o tamanho do prompt ou aguarde o reset do limite."
+                )
+
             espera = 2 ** tentativa
             time.sleep(espera)
+
     raise ultima_excecao
 
-def validar_estrutura_aulas(aulas: List[Dict[str, Any]]) -> None:
-    if not isinstance(aulas, list) or not aulas:
-        raise ValueError("A IA não retornou uma lista válida de aulas.")
-
-def gerar_planejamento_ia(conhecimentos_lista: List[str], carga_horaria: int, numero_aulas: int) -> List[Dict[str, Any]]:
-    texto_conhecimentos = "\n".join(conhecimentos_lista)
+def montar_tipos_aula(numero_aulas: int) -> List[str]:
     aulas_teoricas, aulas_praticas = calcular_distribuicao_teorica_pratica(numero_aulas)
 
+    tipos_restantes = ["teorica"] * aulas_teoricas + ["pratica"] * aulas_praticas
+    resultado = []
+
+    while tipos_restantes:
+        if "teorica" in tipos_restantes:
+            tipos_restantes.remove("teorica")
+            resultado.append("teorica")
+        if "teorica" in tipos_restantes:
+            tipos_restantes.remove("teorica")
+            resultado.append("teorica")
+        if "pratica" in tipos_restantes:
+            tipos_restantes.remove("pratica")
+            resultado.append("pratica")
+
+    return resultado[:numero_aulas]
+
+def distribuir_conhecimentos_sem_repetir(conhecimentos: List[str], numero_aulas: int) -> List[List[str]]:
+    grupos = [[] for _ in range(numero_aulas)]
+
+    if numero_aulas <= 0:
+        raise ValueError("Número de aulas inválido.")
+
+    if not conhecimentos:
+        return grupos
+
+    for i, conhecimento in enumerate(conhecimentos):
+        indice = min(i * numero_aulas // len(conhecimentos), numero_aulas - 1)
+        grupos[indice].append(conhecimento)
+
+    return grupos
+
+def montar_aulas_base(conhecimentos_lista: List[str], numero_aulas: int) -> List[Dict[str, Any]]:
+    tipos = montar_tipos_aula(numero_aulas)
+    grupos = distribuir_conhecimentos_sem_repetir(conhecimentos_lista, numero_aulas)
+
+    aulas = []
+    for i in range(numero_aulas):
+        conhecimentos = grupos[i] if i < len(grupos) else []
+
+        if not conhecimentos and conhecimentos_lista:
+            conhecimentos = [conhecimentos_lista[min(i, len(conhecimentos_lista) - 1)]]
+
+        aulas.append({
+            "aula_numero": i + 1,
+            "tipo": tipos[i] if i < len(tipos) else "teorica",
+            "conhecimentos": conhecimentos
+        })
+
+    return aulas
+
+def gerar_texto_pedagogico_aula(aula: Dict[str, Any]) -> Dict[str, Any]:
     prompt = f"""
-Atue como Especialista Pedagógico em Ensino Técnico.
+Retorne JSON válido com:
+- capacidades: lista com 3 itens
+- estrategias: texto objetivo
+- avaliacoes: texto objetivo
 
-Gere um planejamento de aulas com base EXCLUSIVAMENTE nos tópicos abaixo, extraídos da coluna "Conhecimentos" de uma UC.
+Regras:
+- Não invente conteúdos fora dos conhecimentos informados.
+- Adeque o texto ao tipo da aula.
+- Seja claro, técnico e conciso.
 
-REGRAS:
-1. Carga horária total: {carga_horaria} horas.
-2. Cada aula possui {HORAS_POR_AULA} horas.
-3. Gere EXATAMENTE {numero_aulas} aulas.
-4. Gere EXATAMENTE {aulas_teoricas} aulas com tipo "teorica" e EXATAMENTE {aulas_praticas} aulas com tipo "pratica".
-5. Não invente conteúdos fora da lista oficial.
-6. Cada aula deve conter no mínimo 3 capacidades e 3 conhecimentos.
-7. Estratégias e avaliações devem ser detalhadas, coerentes e específicas.
-8. Retorne SOMENTE JSON válido.
-9. Toda aula DEVE obrigatoriamente conter as chaves: "aula_numero", "tipo", "capacidades", "conhecimentos", "estrategias", "avaliacoes".
-
-Formato:
-{{
-  "aulas": [
-    {{
-      "aula_numero": 1,
-      "tipo": "teorica",
-      "capacidades": ["...", "...", "..."],
-      "conhecimentos": ["...", "...", "..."],
-      "estrategias": "texto detalhado",
-      "avaliacoes": "texto detalhado"
-    }}
-  ]
-}}
-
-Lista oficial:
-{texto_conhecimentos}
+Aula:
+{json.dumps(aula, ensure_ascii=False)}
 """
 
     completion = chamar_ia_com_retry(
         model=MODELO_IA,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=8000,
+        max_tokens=MAX_TOKENS_AULA,
         response_format={"type": "json_object"}
     )
 
     resposta = completion.choices[0].message.content.strip()
     dados = extrair_json_de_texto(resposta)
 
-    if "aulas" not in dados:
-        raise ValueError("A IA não retornou a chave 'aulas'.")
+    capacidades = dados.get("capacidades", [])
+    if not isinstance(capacidades, list):
+        capacidades = []
 
-    validar_estrutura_aulas(dados["aulas"])
-    return dados["aulas"]
+    capacidades = [str(c).strip() for c in capacidades if str(c).strip()][:3]
 
-def distribuir_aulas_progressivamente(aulas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    teoricas = [a for a in aulas if a.get("tipo") == "teorica"]
-    praticas = [a for a in aulas if a.get("tipo") == "pratica"]
+    while len(capacidades) < 3:
+        capacidades.append("Aplicar os conhecimentos desenvolvidos na aula")
 
-    resultado = []
-    while teoricas or praticas:
-        if teoricas:
-            resultado.append(teoricas.pop(0))
-        if teoricas:
-            resultado.append(teoricas.pop(0))
-        if praticas and len(resultado) >= 2:
-            resultado.append(praticas.pop(0))
-
-    resultado.extend(teoricas)
-    resultado.extend(praticas)
-
-    for i, aula in enumerate(resultado, start=1):
-        aula["aula_numero"] = i
-
-    return resultado
-
-def normalizar_aulas(aulas: List[Dict[str, Any]], numero_aulas: int, conhecimentos_base: List[str]) -> List[Dict[str, Any]]:
-    if not aulas:
-        raise ValueError("A IA não retornou nenhuma aula.")
-
-    aulas_teoricas_esperadas, aulas_praticas_esperadas = calcular_distribuicao_teorica_pratica(numero_aulas)
-
-    conhecimentos_fallback = conhecimentos_base[:3] if len(conhecimentos_base) >= 3 else list(conhecimentos_base)
-    if not conhecimentos_fallback:
-        conhecimentos_fallback = ["Conteúdo técnico da unidade curricular"]
-
-    capacidades_fallback = [
-        "Compreender os conceitos apresentados",
-        "Relacionar teoria e prática na unidade curricular",
-        "Aplicar os conhecimentos desenvolvidos em aula"
-    ]
-
-    aulas_normalizadas = []
-
-    for i, aula in enumerate(aulas, start=1):
-        if not isinstance(aula, dict):
-            aula = {}
-
-        tipo = str(aula.get("tipo", "teorica")).strip().lower()
-        if tipo not in ["teorica", "pratica"]:
-            tipo = "teorica"
-
-        capacidades = aula.get("capacidades", [])
-        if not isinstance(capacidades, list):
-            capacidades = [str(capacidades).strip()] if str(capacidades).strip() else []
-
-        conhecimentos = aula.get("conhecimentos", [])
-        if not isinstance(conhecimentos, list):
-            conhecimentos = [str(conhecimentos).strip()] if str(conhecimentos).strip() else []
-
-        capacidades = [str(c).strip() for c in capacidades if str(c).strip()]
-        conhecimentos = [str(c).strip() for c in conhecimentos if str(c).strip()]
-
-        while len(capacidades) < 3:
-            capacidades.append(capacidades_fallback[len(capacidades) % len(capacidades_fallback)])
-
-        while len(conhecimentos) < 3:
-            conhecimentos.append(conhecimentos_fallback[len(conhecimentos) % len(conhecimentos_fallback)])
-
-        estrategias = str(aula.get("estrategias", "")).strip()
-        avaliacoes = str(aula.get("avaliacoes", "")).strip()
-
-        aulas_normalizadas.append({
-            "aula_numero": i,
-            "tipo": tipo,
-            "capacidades": capacidades[:6],
-            "conhecimentos": conhecimentos[:6],
-            "estrategias": estrategias,
-            "avaliacoes": avaliacoes,
-        })
-
-    if len(aulas_normalizadas) > numero_aulas:
-        aulas_normalizadas = aulas_normalizadas[:numero_aulas]
-
-    while len(aulas_normalizadas) < numero_aulas:
-        base = aulas_normalizadas[len(aulas_normalizadas) % len(aulas_normalizadas)]
-        aulas_normalizadas.append({
-            "aula_numero": len(aulas_normalizadas) + 1,
-            "tipo": base.get("tipo", "teorica"),
-            "capacidades": list(base.get("capacidades", capacidades_fallback)),
-            "conhecimentos": list(base.get("conhecimentos", conhecimentos_fallback)),
-            "estrategias": str(base.get("estrategias", "")).strip(),
-            "avaliacoes": str(base.get("avaliacoes", "")).strip(),
-        })
-
-    teoricas = [a for a in aulas_normalizadas if a.get("tipo") == "teorica"]
-    praticas = [a for a in aulas_normalizadas if a.get("tipo") == "pratica"]
-
-    while len(teoricas) > aulas_teoricas_esperadas:
-        aula = teoricas.pop()
-        aula["tipo"] = "pratica"
-        praticas.append(aula)
-
-    while len(praticas) > aulas_praticas_esperadas:
-        aula = praticas.pop()
-        aula["tipo"] = "teorica"
-        teoricas.append(aula)
-
-    while len(teoricas) < aulas_teoricas_esperadas and praticas:
-        aula = praticas.pop(0)
-        aula["tipo"] = "teorica"
-        teoricas.append(aula)
-
-    while len(praticas) < aulas_praticas_esperadas and teoricas:
-        aula = teoricas.pop()
-        aula["tipo"] = "pratica"
-        praticas.append(aula)
-
-    aulas_ordenadas = distribuir_aulas_progressivamente(teoricas + praticas)
-
-    for i, aula in enumerate(aulas_ordenadas, start=1):
-        aula["aula_numero"] = i
-
-    return aulas_ordenadas
+    return {
+        "capacidades": capacidades,
+        "estrategias": str(dados.get("estrategias", "")).strip(),
+        "avaliacoes": str(dados.get("avaliacoes", "")).strip(),
+    }
 
 def enriquecer_campos_aula(aula: Dict[str, Any]) -> Dict[str, Any]:
     tipo = str(aula.get("tipo", "teorica")).strip().lower()
@@ -735,6 +661,23 @@ def enriquecer_campos_aula(aula: Dict[str, Any]) -> Dict[str, Any]:
     aula["estrategias"] = estrategias
     aula["avaliacoes"] = avaliacoes
     return aula
+
+def complementar_aula(aula: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        complemento = gerar_texto_pedagogico_aula(aula)
+        aula["capacidades"] = complemento["capacidades"]
+        aula["estrategias"] = complemento["estrategias"]
+        aula["avaliacoes"] = complemento["avaliacoes"]
+    except Exception:
+        aula["capacidades"] = [
+            "Compreender os conteúdos propostos",
+            "Relacionar fundamentos e aplicação técnica",
+            "Aplicar os conhecimentos desenvolvidos na aula"
+        ]
+        aula["estrategias"] = ""
+        aula["avaliacoes"] = ""
+
+    return enriquecer_campos_aula(aula)
 
 # ==========================================
 # EXCEL
@@ -812,19 +755,8 @@ def processar_arquivos(pdf_bytes: bytes, excel_bytes: bytes) -> Dict[str, Any]:
         carga_horaria = extrair_carga_horaria(texto_extraido)
         numero_aulas = calcular_numero_aulas(carga_horaria, HORAS_POR_AULA)
 
-        aulas_estruturadas = gerar_planejamento_ia(
-            conhecimentos_lista=conhecimentos_lista,
-            carga_horaria=carga_horaria,
-            numero_aulas=numero_aulas
-        )
-
-        aulas_estruturadas = normalizar_aulas(
-            aulas_estruturadas,
-            numero_aulas,
-            conhecimentos_lista
-        )
-
-        aulas_estruturadas = [enriquecer_campos_aula(aula) for aula in aulas_estruturadas]
+        aulas_base = montar_aulas_base(conhecimentos_lista, numero_aulas)
+        aulas_estruturadas = [complementar_aula(aula) for aula in aulas_base]
 
         arquivo_saida = preencher_excel_em_memoria(
             dados_aulas=aulas_estruturadas,
