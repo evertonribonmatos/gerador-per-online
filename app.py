@@ -171,15 +171,22 @@ def localizar_cabecalho_conhecimentos_por_palavra(pdf) -> Optional[Dict[str, Any
         for palavra in palavras:
             texto = normalizar_comparacao(palavra.get("text", ""))
             if texto == "conhecimentos":
-                debug.append(
-                    f"Cabeçalho 'Conhecimentos' encontrado na página {idx_pagina + 1}: "
-                    f"x0={palavra['x0']:.2f}, x1={palavra['x1']:.2f}, top={palavra['top']:.2f}, bottom={palavra['bottom']:.2f}"
-                )
+                debug.append(f"✓ Encontrado 'conhecimentos' na página {idx_pagina + 1}")
                 return {
                     "pagina": idx_pagina,
                     "palavra": palavra,
                     "debug": debug
                 }
+
+        # Fallback: procura por "conteúdos formativos" ou "conhecimentos"
+        for palavra in palavras:
+            texto = normalizar_comparacao(palavra.get("text", ""))
+            if "conteúdos formativos" in texto or "conteudos formativos" in texto:
+                debug.append(f"✓ Encontrou 'conteúdos formativos' na página {idx_pagina + 1}")
+                # Procura a palavra "conhecimentos" na mesma linha
+                for p in palavras:
+                    if normalizar_comparacao(p.get("text", "")) == "conhecimentos":
+                        return {"pagina": idx_pagina, "palavra": p, "debug": debug}
 
     return None
 
