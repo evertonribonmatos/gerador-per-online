@@ -436,42 +436,27 @@ def extrair_coluna_conhecimentos(caminho_pdf: str) -> Tuple[List[str], List[str]
 # CARGA HORÁRIA
 # ==========================================
 def extrair_carga_horaria(texto_pdf: str) -> int:
-    texto = normalizar_texto(texto_pdf)
+    texto = normalizar_texto(texto_pdf).lower()
 
-    padroes_prioritarios = [
-        r"carga\s*hor[aá]ria\s*total\s*[:\-]?\s*(\d+)\s*(h|hora|horas)\b",
-        r"carga\s*hor[aá]ria\s*da\s*uc\s*[:\-]?\s*(\d+)\s*(h|hora|horas)\b",
-        r"carga\s*hor[aá]ria\s*[:\-]?\s*(\d+)\s*(h|hora|horas)\b",
-        r"\bch\s*[:\-]?\s*(\d+)\s*(h|hora|horas)\b",
+    # Prioridade 1: "carga horária da uc" ou "carga horária total da uc"
+    padroes = [
+        r"carga\s*hor[aá]ria\s*(?:da\s*uc|total\s*da\s*uc)\s*[:\-]?\s*(\d+)\s*(?:h|hora|horas)?",
+        r"carga\s*hor[aá]ria\s*[:\-]?\s*(\d+)\s*(?:h|hora|horas)?\s*(?:da\s*uc|unidade\s*curricular)",
+        r"\bch\s*[:\-]?\s*(\d+)\s*(?:h|hora|horas)?\b",
     ]
 
-    for padrao in padroes_prioritarios:
+    for padrao in padroes:
         match = re.search(padrao, texto, re.IGNORECASE)
         if match:
             return int(match.group(1))
 
-    candidatos = []
-    for m in re.finditer(r".{0,40}\b(\d+)\s*(h|hora|horas)\b.{0,40}", texto, re.IGNORECASE):
-        trecho = m.group(0).lower()
+    # Fallback mais seguro
+    for m in re.finditer(r"(\d+)\s*(?:h|hora|horas)", texto):
         valor = int(m.group(1))
-        score = 0
+        if 20 <= valor <= 200:          # faixa realista para UCs de técnico
+            return valor
 
-        if "carga horária" in trecho or "carga horaria" in trecho:
-            score += 10
-        if "uc" in trecho or "unidade curricular" in trecho:
-            score += 5
-        if valor % HORAS_POR_AULA == 0:
-            score += 2
-        if valor >= HORAS_POR_AULA:
-            score += 1
-
-        candidatos.append((score, valor, trecho))
-
-    if candidatos:
-        candidatos.sort(reverse=True)
-        return candidatos[0][1]
-
-    raise ValueError("Não foi possível identificar a carga horária no PDF.")
+    raise ValueError("Não foi possível identificar a carga horária da UC no PDF.")
 
 # ==========================================
 # AULAS
