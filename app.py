@@ -76,11 +76,28 @@ def normalizar_comparacao(texto: Any) -> str:
 
 def texto_parece_topico(texto: str) -> bool:
     texto = normalizar_linha(texto)
+
     padroes = [
         r"^\d+(?:\.\d+)*[.)]?\s+.+",
         r"^\d+(?:\.\d+)*[.)]?\s*[-:]\s*.+",
     ]
-    return any(re.match(p, texto) for p in padroes)
+    if any(re.match(p, texto) for p in padroes):
+        return True
+
+    termos_fortes = [
+        "equipamentos",
+        "manuseio",
+        "evolução",
+        "armazenagem",
+        "embalagens",
+        "documento",
+        "formas de armazenagem",
+        "movimentação",
+        "automação",
+        "otimização",
+    ]
+    t = normalizar_comparacao(texto)
+    return any(t.startswith(normalizar_comparacao(k)) for k in termos_fortes)
 
 def linha_eh_ruido(texto: str) -> bool:
     t = normalizar_comparacao(texto)
@@ -104,6 +121,13 @@ def linha_eh_ruido(texto: str) -> bool:
         "data termino da uc",
         "unidade curricular",
         "ch",
+        "conteudos formativos",
+        "ambiente(s) pedagogico(s)",
+        "ambientes pedagogicos",
+        "bibliografia de apoio ao curso",
+        "perfil docente",
+        "funcao",
+        "objetivo geral",
     }
 
     if t in linhas_ruido_exatas:
@@ -112,6 +136,8 @@ def linha_eh_ruido(texto: str) -> bool:
     expressoes_ruido = [
         "pagina ",
         "página ",
+        "aprendizagem profissional",
+        "ppja",
     ]
 
     return any(expr in t for expr in expressoes_ruido)
@@ -138,26 +164,34 @@ def extrair_json_de_texto(texto: str) -> Dict[str, Any]:
 # ==========================================
 # EXTRAIR TEXTO COMPLETO
 # ==========================================
-def extrair_texto_pdf(caminho_pdf: str) -> str:
+def extrair_texto_pdf(caminho_pdf: str) -> Tuple[str, List[str], str]:
+    """
+    Retorna:
+    - texto_final
+    - logs
+    - metodo_usado
+    """
     if not os.path.exists(caminho_pdf):
         raise FileNotFoundError(f"Arquivo PDF não encontrado: {caminho_pdf}")
 
+    logs = []
     texto_completo = []
 
     with pdfplumber.open(caminho_pdf) as pdf:
         for numero_pagina, pagina in enumerate(pdf.pages, start=1):
             texto = pagina.extract_text()
-            if texto:
+            if texto and texto.strip():
+                logs.append(f"Página {numero_pagina}: texto extraído com pdfplumber.")
                 texto_completo.append(texto)
             else:
-                texto_completo.append("")
+                logs.append(f"Página {numero_pagina}: sem texto via pdfplumber.")
 
     texto_final = "\n".join(texto_completo).strip()
 
     if not texto_final:
         raise ValueError("Não foi possível extrair texto do PDF.")
 
-    return texto_final
+    return texto_final, logs, "pdfplumber"
 
 # ==========================================
 # LOCALIZAR CABEÇALHO
@@ -178,12 +212,10 @@ def localizar_cabecalho_conhecimentos_por_palavra(pdf) -> Optional[Dict[str, Any
                     "debug": debug
                 }
 
-        # Fallback: procura por "conteúdos formativos" ou "conhecimentos"
         for palavra in palavras:
             texto = normalizar_comparacao(palavra.get("text", ""))
-            if "conteúdos formativos" in texto or "conteudos formativos" in texto:
+            if "conteudos formativos" in texto or "conteúdos formativos" in texto:
                 debug.append(f"✓ Encontrou 'conteúdos formativos' na página {idx_pagina + 1}")
-                # Procura a palavra "conhecimentos" na mesma linha
                 for p in palavras:
                     if normalizar_comparacao(p.get("text", "")) == "conhecimentos":
                         return {"pagina": idx_pagina, "palavra": p, "debug": debug}
@@ -329,7 +361,7 @@ def extrair_conhecimentos_por_coordenada(pdf, pagina_inicial: int, faixa: Dict[s
                     linhas = [normalizar_linha(l) for l in texto.split("\n") if normalizar_linha(l)]
                     debug.append(f"[PÁGINA {idx_pagina + 1}] fallback crop/extract_text retornou {len(linhas)} linhas.")
             except Exception as e:
-                debug.append(f"[PÁGINA {idx_pagina + 1}] erro no fallback: {e}")
+                debug.append(f"[PÁGINA {idx_pagina + 1}] erro no fallback crop/extract_text: {e}")
 
         topicos_brutos.extend(linhas)
 
@@ -445,9 +477,8 @@ def extrair_coluna_conhecimentos(caminho_pdf: str) -> Tuple[List[str], List[str]
 def extrair_carga_horaria(texto_pdf: str) -> int:
     texto = normalizar_texto(texto_pdf).lower()
 
-    # Prioridade 1: "carga horária da uc" ou "carga horária total da uc"
     padroes = [
-        r"carga\s*hor[aá]ria\s*(?:da\s*uc|total\s*da\s*uc)\s*[:\-]?\s*(\d+)\s*(?:h|hora|horas)?",
+        r"carga\s*hor[aá]ria\s*(?:da\s*uc|total\s*da\s*uc)?\s*[:\-]?\s*(\d+)\s*(?:h|hora|horas)\b",
         r"carga\s*hor[aá]ria\s*[:\-]?\s*(\d+)\s*(?:h|hora|horas)?\s*(?:da\s*uc|unidade\s*curricular)",
         r"\bch\s*[:\-]?\s*(\d+)\s*(?:h|hora|horas)?\b",
     ]
@@ -457,10 +488,19 @@ def extrair_carga_horaria(texto_pdf: str) -> int:
         if match:
             return int(match.group(1))
 
-    # Fallback mais seguro
-    for m in re.finditer(r"(\d+)\s*(?:h|hora|horas)", texto):
+    linhas = texto.split("\n")
+    for i, linha in enumerate(linhas):
+        contexto = " ".join(linhas[max(0, i-2): min(len(linhas), i+3)])
+        if "carga horaria" in contexto or "unidade curricular" in contexto:
+            m = re.search(r"\b(\d{2,3})\s*h\b", contexto)
+            if m:
+                valor = int(m.group(1))
+                if 20 <= valor <= 300:
+                    return valor
+
+    for m in re.finditer(r"\b(\d{2,3})\s*h\b", texto):
         valor = int(m.group(1))
-        if 20 <= valor <= 200:          # faixa realista para UCs de técnico
+        if 20 <= valor <= 300:
             return valor
 
     raise ValueError("Não foi possível identificar a carga horária da UC no PDF.")
@@ -738,9 +778,13 @@ def processar_arquivos(pdf_bytes: bytes, excel_bytes: bytes) -> Dict[str, Any]:
         caminho_pdf = tmp_pdf.name
 
     try:
-        texto_extraido = extrair_texto_pdf(caminho_pdf)
+        texto_extraido, logs_texto, metodo_texto = extrair_texto_pdf(caminho_pdf)
+        debug = list(logs_texto)
 
-        conhecimentos_lista, debug = extrair_coluna_conhecimentos(caminho_pdf)
+        conhecimentos_lista, debug_conhecimentos = extrair_coluna_conhecimentos(caminho_pdf)
+        debug.extend(debug_conhecimentos)
+        debug.append("Conhecimentos extraídos por coordenadas/pdfplumber.")
+
         if not conhecimentos_lista:
             raise ValueError("Nenhum tópico foi extraído da coluna 'Conhecimentos'.")
 
@@ -762,7 +806,8 @@ def processar_arquivos(pdf_bytes: bytes, excel_bytes: bytes) -> Dict[str, Any]:
             "numero_aulas": numero_aulas,
             "aulas": aulas_estruturadas,
             "arquivo_saida": arquivo_saida,
-            "modelo_usado": MODELO_IA
+            "modelo_usado": MODELO_IA,
+            "metodo_extracao_texto": metodo_texto
         }
 
     finally:
@@ -798,6 +843,7 @@ if st.button("🚀 Gerar PER preenchido"):
             st.write(f"**Carga horária identificada:** {resultado['carga_horaria']} horas")
             st.write(f"**Número de aulas:** {resultado['numero_aulas']}")
             st.write(f"**Modelo usado:** {resultado['modelo_usado']}")
+            st.write(f"**Método de extração do texto:** {resultado['metodo_extracao_texto']}")
 
             with st.expander("Tópicos extraídos"):
                 for i, topico in enumerate(resultado["conhecimentos"], start=1):
@@ -815,6 +861,10 @@ if st.button("🚀 Gerar PER preenchido"):
                     st.write("**Avaliações**")
                     st.write(aula["avaliacoes"])
                     st.divider()
+
+            with st.expander("Debug de processamento"):
+                for item in resultado["debug"]:
+                    st.write("-", item)
 
             st.download_button(
                 label="📥 Baixar PER_Preenchido.xlsx",
