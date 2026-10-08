@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import math
 import tempfile
 from io import BytesIO
 from typing import List, Dict, Any, Optional, Tuple
@@ -11,6 +12,10 @@ import openpyxl
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
+
+from pdf2image import convert_from_path
+import pytesseract
+from PIL import Image
 
 # ==========================================
 # CONFIGURAÇÕES
@@ -27,7 +32,15 @@ PERCENTUAL_PRATICA = 0.35
 PERCENTUAL_TEORICA = 0.65
 
 MODELO_IA = "openai/gpt-oss-120b"
-MAX_TOKENS_AULA = 500
+
+# Agora uma chamada em lote
+MAX_TOKENS_LOTE = 4000
+
+OCR_LANG = "por"
+OCR_DPI = 300
+
+# Se necessário no Windows:
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # ==========================================
 # .ENV / SECRETS / CLIENTE IA
@@ -74,8 +87,34 @@ def normalizar_comparacao(texto: Any) -> str:
     texto = remover_acentos_simples(texto)
     return texto
 
+def valor_equivale(numero_celula: Any, valor_esperado: Any) -> bool:
+    try:
+        return float(numero_celula) == float(valor_esperado)
+    except Exception:
+        return False
+
+def extrair_json_de_texto(texto: str) -> Dict[str, Any]:
+    texto = texto.strip()
+    try:
+        return json.loads(texto)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", texto, re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+
+    raise ValueError("Não foi possível extrair JSON válido da resposta da IA.")
+
+def chunk_list(lst: List[Any], size: int) -> List[List[Any]]:
+    return [lst[i:i + size] for i in range(0, len(lst), size)]
+
+# ==========================================
+# HEURÍSTICAS
+# ==========================================
 def texto_parece_topico(texto: str) -> bool:
     texto = normalizar_linha(texto)
+    t = normalizar_comparacao(texto)
 
     padroes = [
         r"^\d+(?:\.\d+)*[.)]?\s+.+",
@@ -85,19 +124,26 @@ def texto_parece_topico(texto: str) -> bool:
         return True
 
     termos_fortes = [
-        "equipamentos",
-        "manuseio",
-        "evolução",
-        "armazenagem",
-        "embalagens",
-        "documento",
-        "formas de armazenagem",
-        "movimentação",
-        "automação",
-        "otimização",
+        "equipamentos utilizados no transporte e armazenagem de bens",
+        "manuseio de equipamentos e materiais",
+        "a evolução da armazenagem",
+        "a armazenagem como parte da cadeia de abastecimento",
+        "embalagens de armazenamento",
+        "documento de embalagem e processos",
+        "formas de armazenagem de materiais",
+        "movimentação de materiais e requisições",
+        "a automação na armazenagem",
+        "otimização de instalações de armazenagem",
     ]
-    t = normalizar_comparacao(texto)
-    return any(t.startswith(normalizar_comparacao(k)) for k in termos_fortes)
+
+    if any(t.startswith(normalizar_comparacao(k)) for k in termos_fortes):
+        return True
+
+    # Heurística genérica: linha curta/média terminando com :
+    if texto.endswith(":") and 5 <= len(texto) <= 120:
+        return True
+
+    return False
 
 def linha_eh_ruido(texto: str) -> bool:
     t = normalizar_comparacao(texto)
@@ -128,6 +174,10 @@ def linha_eh_ruido(texto: str) -> bool:
         "perfil docente",
         "funcao",
         "objetivo geral",
+        "sala de aula",
+        "equipamentos",
+        "ferramentas",
+        "materiais",
     }
 
     if t in linhas_ruido_exatas:
@@ -142,35 +192,27 @@ def linha_eh_ruido(texto: str) -> bool:
 
     return any(expr in t for expr in expressoes_ruido)
 
-def valor_equivale(numero_celula: Any, valor_esperado: Any) -> bool:
-    try:
-        return float(numero_celula) == float(valor_esperado)
-    except Exception:
-        return False
+# ==========================================
+# OCR
+# ==========================================
+def ocr_imagem_pil(img: Image.Image) -> str:
+    texto = pytesseract.image_to_string(img, lang=OCR_LANG)
+    return normalizar_texto(texto)
 
-def extrair_json_de_texto(texto: str) -> Dict[str, Any]:
-    texto = texto.strip()
-    try:
-        return json.loads(texto)
-    except json.JSONDecodeError:
-        pass
+def extrair_texto_pdf_com_ocr(caminho_pdf: str, dpi: int = OCR_DPI) -> str:
+    imagens = convert_from_path(caminho_pdf, dpi=dpi)
+    textos = []
 
-    match = re.search(r"\{.*\}", texto, re.DOTALL)
-    if match:
-        return json.loads(match.group(0))
+    for img in imagens:
+        texto = ocr_imagem_pil(img)
+        textos.append(texto)
 
-    raise ValueError("Não foi possível extrair JSON válido da resposta da IA.")
+    return "\n".join([t for t in textos if t]).strip()
 
 # ==========================================
-# EXTRAIR TEXTO COMPLETO
+# EXTRAÇÃO DE TEXTO DO PDF
 # ==========================================
 def extrair_texto_pdf(caminho_pdf: str) -> Tuple[str, List[str], str]:
-    """
-    Retorna:
-    - texto_final
-    - logs
-    - metodo_usado
-    """
     if not os.path.exists(caminho_pdf):
         raise FileNotFoundError(f"Arquivo PDF não encontrado: {caminho_pdf}")
 
@@ -187,14 +229,20 @@ def extrair_texto_pdf(caminho_pdf: str) -> Tuple[str, List[str], str]:
                 logs.append(f"Página {numero_pagina}: sem texto via pdfplumber.")
 
     texto_final = "\n".join(texto_completo).strip()
+    if texto_final:
+        return texto_final, logs, "pdfplumber"
 
-    if not texto_final:
-        raise ValueError("Não foi possível extrair texto do PDF.")
+    logs.append("Fallback OCR acionado para texto completo.")
+    texto_ocr = extrair_texto_pdf_com_ocr(caminho_pdf)
 
-    return texto_final, logs, "pdfplumber"
+    if texto_ocr:
+        logs.append("Texto extraído com sucesso via OCR.")
+        return texto_ocr, logs, "ocr"
+
+    raise ValueError("Não foi possível extrair texto do PDF nem por pdfplumber nem por OCR.")
 
 # ==========================================
-# LOCALIZAR CABEÇALHO
+# EXTRAÇÃO ESTRUTURADA DA COLUNA CONHECIMENTOS
 # ==========================================
 def localizar_cabecalho_conhecimentos_por_palavra(pdf) -> Optional[Dict[str, Any]]:
     debug = []
@@ -212,19 +260,8 @@ def localizar_cabecalho_conhecimentos_por_palavra(pdf) -> Optional[Dict[str, Any
                     "debug": debug
                 }
 
-        for palavra in palavras:
-            texto = normalizar_comparacao(palavra.get("text", ""))
-            if "conteudos formativos" in texto or "conteúdos formativos" in texto:
-                debug.append(f"✓ Encontrou 'conteúdos formativos' na página {idx_pagina + 1}")
-                for p in palavras:
-                    if normalizar_comparacao(p.get("text", "")) == "conhecimentos":
-                        return {"pagina": idx_pagina, "palavra": p, "debug": debug}
-
     return None
 
-# ==========================================
-# INFERIR FAIXA DA COLUNA
-# ==========================================
 def inferir_faixa_coluna_por_cabecalho(pagina, palavra_cabecalho: Dict[str, Any]) -> Dict[str, float]:
     palavras = pagina.extract_words(use_text_flow=True, keep_blank_chars=False)
 
@@ -268,9 +305,6 @@ def inferir_faixa_coluna_por_cabecalho(pagina, palavra_cabecalho: Dict[str, Any]
         "bottom": pagina.height
     }
 
-# ==========================================
-# RECONSTRUIR LINHAS
-# ==========================================
 def palavra_esta_na_faixa(palavra: Dict[str, Any], x0: float, x1: float, tolerancia_x: float = TOLERANCIA_X_FAIXA) -> bool:
     return not (palavra["x1"] < (x0 - tolerancia_x) or palavra["x0"] > (x1 + tolerancia_x))
 
@@ -326,14 +360,9 @@ def reconstruir_linhas_por_palavras(
 
     return linhas_texto
 
-# ==========================================
-# EXTRAÇÃO POR COORDENADA
-# ==========================================
 def extrair_conhecimentos_por_coordenada(pdf, pagina_inicial: int, faixa: Dict[str, float]) -> Tuple[List[str], List[str]]:
     topicos_brutos = []
-    debug = [
-        f"Faixa inferida: x0={faixa['x0']:.2f}, x1={faixa['x1']:.2f}, top={faixa['top']:.2f}"
-    ]
+    debug = [f"Faixa inferida: x0={faixa['x0']:.2f}, x1={faixa['x1']:.2f}, top={faixa['top']:.2f}"]
 
     for idx_pagina, pagina in enumerate(pdf.pages):
         if idx_pagina < pagina_inicial:
@@ -359,9 +388,9 @@ def extrair_conhecimentos_por_coordenada(pdf, pagina_inicial: int, faixa: Dict[s
                 texto = recorte.extract_text(x_tolerance=2, y_tolerance=2)
                 if texto:
                     linhas = [normalizar_linha(l) for l in texto.split("\n") if normalizar_linha(l)]
-                    debug.append(f"[PÁGINA {idx_pagina + 1}] fallback crop/extract_text retornou {len(linhas)} linhas.")
+                    debug.append(f"[PÁGINA {idx_pagina + 1}] crop/extract_text retornou {len(linhas)} linhas.")
             except Exception as e:
-                debug.append(f"[PÁGINA {idx_pagina + 1}] erro no fallback crop/extract_text: {e}")
+                debug.append(f"[PÁGINA {idx_pagina + 1}] erro no crop/extract_text: {e}")
 
         topicos_brutos.extend(linhas)
 
@@ -377,29 +406,22 @@ def avaliar_qualidade_extracao(linhas: List[str]) -> int:
 
     for linha in linhas:
         if texto_parece_topico(linha):
-            topicos += 1
+            topicos += 10
         if linha_eh_ruido(linha):
-            ruidos += 1
+            ruidos += 5
 
-    score += topicos * 10
-    score -= ruidos * 5
+    score += topicos
+    score -= ruidos
     score += len(linhas)
     return score
 
-# ==========================================
-# AGRUPAR TÓPICOS
-# ==========================================
 def agrupar_topicos(topicos_brutos: List[str]) -> List[str]:
     topicos_agrupados = []
     atual = None
 
     for linha in topicos_brutos:
         linha_norm = normalizar_linha(linha)
-
-        if not linha_norm:
-            continue
-
-        if linha_eh_ruido(linha_norm):
+        if not linha_norm or linha_eh_ruido(linha_norm):
             continue
 
         if texto_parece_topico(linha_norm):
@@ -415,7 +437,6 @@ def agrupar_topicos(topicos_brutos: List[str]) -> List[str]:
 
     vistos = set()
     topicos_finais = []
-
     for item in topicos_agrupados:
         item_limpo = normalizar_linha(item)
         item_chave = normalizar_comparacao(item_limpo)
@@ -425,13 +446,7 @@ def agrupar_topicos(topicos_brutos: List[str]) -> List[str]:
 
     return topicos_finais
 
-# ==========================================
-# EXTRAÇÃO FINAL
-# ==========================================
 def extrair_coluna_conhecimentos(caminho_pdf: str) -> Tuple[List[str], List[str]]:
-    if not os.path.exists(caminho_pdf):
-        raise FileNotFoundError(f"Arquivo PDF não encontrado: {caminho_pdf}")
-
     with pdfplumber.open(caminho_pdf) as pdf:
         info_cabecalho = localizar_cabecalho_conhecimentos_por_palavra(pdf)
 
@@ -455,14 +470,10 @@ def extrair_coluna_conhecimentos(caminho_pdf: str) -> Tuple[List[str], List[str]
 
         if score_expandido > score_base:
             topicos_brutos = bruto_expandido
-            debug = info_cabecalho.get("debug", []) + debug_expandido + [
-                f"Método escolhido: faixa expandida (score={score_expandido})"
-            ]
+            debug = info_cabecalho.get("debug", []) + debug_expandido + [f"Método escolhido: faixa expandida (score={score_expandido})"]
         else:
             topicos_brutos = bruto_base
-            debug = info_cabecalho.get("debug", []) + debug_base + [
-                f"Método escolhido: faixa base (score={score_base})"
-            ]
+            debug = info_cabecalho.get("debug", []) + debug_base + [f"Método escolhido: faixa base (score={score_base})"]
 
     topicos_finais = agrupar_topicos(topicos_brutos)
 
@@ -470,6 +481,70 @@ def extrair_coluna_conhecimentos(caminho_pdf: str) -> Tuple[List[str], List[str]
         raise ValueError("Nenhum tópico válido foi extraído da coluna 'Conhecimentos'.")
 
     return topicos_finais, debug
+
+# ==========================================
+# FALLBACK PARA CONHECIMENTOS VIA TEXTO OCR
+# ==========================================
+def extrair_conhecimentos_do_texto(texto_pdf: str) -> Tuple[List[str], List[str]]:
+    debug = []
+    texto = normalizar_texto(texto_pdf)
+
+    inicio_match = re.search(r"\bConhecimentos\b", texto, re.IGNORECASE)
+    if not inicio_match:
+        raise ValueError("Não foi possível localizar o bloco 'Conhecimentos' no texto.")
+
+    inicio = inicio_match.end()
+
+    padroes_fim = [
+        r"\bAmbiente\(s\)\s+Pedag[oó]gico\(s\)\b",
+        r"\bAmbientes\s+Pedag[oó]gicos\b",
+        r"\bBibliografia\b",
+        r"\bPerfil\s+Docente\b",
+    ]
+
+    fim = len(texto)
+    for padrao in padroes_fim:
+        m = re.search(padrao, texto[inicio:], re.IGNORECASE)
+        if m:
+            fim = min(fim, inicio + m.start())
+
+    bloco = texto[inicio:fim].strip()
+    debug.append("Bloco de conhecimentos localizado por texto/OCR.")
+
+    linhas = [normalizar_linha(l) for l in bloco.split("\n") if normalizar_linha(l)]
+    linhas = [l for l in linhas if not linha_eh_ruido(l)]
+
+    topicos = []
+    atual = None
+
+    for linha in linhas:
+        if texto_parece_topico(linha):
+            if atual:
+                topicos.append(atual.strip())
+            atual = linha
+        else:
+            if atual:
+                atual += " " + linha
+            else:
+                atual = linha
+
+    if atual:
+        topicos.append(atual.strip())
+
+    topicos = [t for t in topicos if len(normalizar_comparacao(t)) > 5]
+
+    vistos = set()
+    finais = []
+    for t in topicos:
+        chave = normalizar_comparacao(t)
+        if chave not in vistos:
+            vistos.add(chave)
+            finais.append(t)
+
+    if not finais:
+        raise ValueError("Falha ao estruturar tópicos de conhecimentos a partir do texto/OCR.")
+
+    return finais, debug
 
 # ==========================================
 # CARGA HORÁRIA
@@ -489,7 +564,7 @@ def extrair_carga_horaria(texto_pdf: str) -> int:
             return int(match.group(1))
 
     linhas = texto.split("\n")
-    for i, linha in enumerate(linhas):
+    for i, _ in enumerate(linhas):
         contexto = " ".join(linhas[max(0, i-2): min(len(linhas), i+3)])
         if "carga horaria" in contexto or "unidade curricular" in contexto:
             m = re.search(r"\b(\d{2,3})\s*h\b", contexto)
@@ -506,7 +581,7 @@ def extrair_carga_horaria(texto_pdf: str) -> int:
     raise ValueError("Não foi possível identificar a carga horária da UC no PDF.")
 
 # ==========================================
-# AULAS
+# MONTAGEM DAS AULAS
 # ==========================================
 def calcular_numero_aulas(carga_horaria: int, horas_por_aula: int = 4) -> int:
     if carga_horaria <= 0:
@@ -531,26 +606,6 @@ def calcular_distribuicao_teorica_pratica(numero_aulas: int) -> Tuple[int, int]:
         aulas_praticas = numero_aulas - 1
 
     return aulas_teoricas, aulas_praticas
-
-def chamar_ia_com_retry(**kwargs):
-    ultima_excecao = None
-    for tentativa in range(3):
-        try:
-            return client.chat.completions.create(**kwargs)
-        except Exception as e:
-            ultima_excecao = e
-            msg = str(e).lower()
-
-            if "request too large" in msg or "rate_limit_exceeded" in msg:
-                raise ValueError(
-                    "A requisição excedeu o limite de tokens da conta/modelo. "
-                    "Reduza o tamanho do prompt ou aguarde o reset do limite."
-                )
-
-            espera = 2 ** tentativa
-            time.sleep(espera)
-
-    raise ultima_excecao
 
 def montar_tipos_aula(numero_aulas: int) -> List[str]:
     aulas_teoricas, aulas_praticas = calcular_distribuicao_teorica_pratica(numero_aulas)
@@ -605,47 +660,102 @@ def montar_aulas_base(conhecimentos_lista: List[str], numero_aulas: int) -> List
 
     return aulas
 
-def gerar_texto_pedagogico_aula(aula: Dict[str, Any]) -> Dict[str, Any]:
+# ==========================================
+# IA EM LOTE
+# ==========================================
+def chamar_ia_com_retry(**kwargs):
+    ultima_excecao = None
+    for tentativa in range(3):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            ultima_excecao = e
+            msg = str(e).lower()
+
+            if "request too large" in msg or "rate_limit_exceeded" in msg:
+                raise ValueError(
+                    "A requisição excedeu o limite de tokens da conta/modelo. "
+                    "Reduza o tamanho do prompt ou aguarde o reset do limite."
+                )
+
+            espera = 2 ** tentativa
+            time.sleep(espera)
+
+    raise ultima_excecao
+
+def gerar_textos_pedagogicos_em_lote(aulas_base: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Faz UMA chamada para gerar todas as aulas.
+    """
     prompt = f"""
-Retorne JSON válido com:
-- capacidades: lista com 3 itens
-- estrategias: texto objetivo
-- avaliacoes: texto objetivo
+Retorne APENAS JSON válido no formato:
+{{
+  "aulas": [
+    {{
+      "aula_numero": 1,
+      "capacidades": ["...", "...", "..."],
+      "estrategias": "...",
+      "avaliacoes": "..."
+    }}
+  ]
+}}
 
 Regras:
+- Uma entrada para cada aula recebida.
+- Exatamente 3 capacidades por aula.
 - Não invente conteúdos fora dos conhecimentos informados.
-- Adeque o texto ao tipo da aula.
-- Seja claro, técnico e conciso.
+- Adeque estratégias e avaliações ao tipo da aula.
+- Seja técnico, claro, objetivo e conciso.
+- Não use markdown.
+- Não omita nenhuma aula.
 
-Aula:
-{json.dumps(aula, ensure_ascii=False)}
+Aulas:
+{json.dumps(aulas_base, ensure_ascii=False)}
 """
 
     completion = chamar_ia_com_retry(
         model=MODELO_IA,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=MAX_TOKENS_AULA,
+        max_tokens=MAX_TOKENS_LOTE,
         response_format={"type": "json_object"}
     )
 
     resposta = completion.choices[0].message.content.strip()
     dados = extrair_json_de_texto(resposta)
 
-    capacidades = dados.get("capacidades", [])
-    if not isinstance(capacidades, list):
-        capacidades = []
+    aulas_resp = dados.get("aulas", [])
+    if not isinstance(aulas_resp, list):
+        raise ValueError("Resposta da IA não trouxe a lista 'aulas' corretamente.")
 
-    capacidades = [str(c).strip() for c in capacidades if str(c).strip()][:3]
+    mapa = {}
+    for item in aulas_resp:
+        if not isinstance(item, dict):
+            continue
+        numero = item.get("aula_numero")
+        if numero is not None:
+            mapa[int(numero)] = item
 
-    while len(capacidades) < 3:
-        capacidades.append("Aplicar os conhecimentos desenvolvidos na aula")
+    resultado = []
+    for aula in aulas_base:
+        numero = aula["aula_numero"]
+        item = mapa.get(numero, {})
 
-    return {
-        "capacidades": capacidades,
-        "estrategias": str(dados.get("estrategias", "")).strip(),
-        "avaliacoes": str(dados.get("avaliacoes", "")).strip(),
-    }
+        capacidades = item.get("capacidades", [])
+        if not isinstance(capacidades, list):
+            capacidades = []
+        capacidades = [str(c).strip() for c in capacidades if str(c).strip()][:3]
+        while len(capacidades) < 3:
+            capacidades.append("Aplicar os conhecimentos desenvolvidos na aula")
+
+        resultado.append({
+            **aula,
+            "capacidades": capacidades,
+            "estrategias": str(item.get("estrategias", "")).strip(),
+            "avaliacoes": str(item.get("avaliacoes", "")).strip(),
+        })
+
+    return resultado
 
 def enriquecer_campos_aula(aula: Dict[str, Any]) -> Dict[str, Any]:
     tipo = str(aula.get("tipo", "teorica")).strip().lower()
@@ -658,58 +768,49 @@ def enriquecer_campos_aula(aula: Dict[str, Any]) -> Dict[str, Any]:
     estrategias = str(aula.get("estrategias", "")).strip()
     avaliacoes = str(aula.get("avaliacoes", "")).strip()
 
-    if len(estrategias) < 140:
+    if len(estrategias) < 120:
         if tipo == "teorica":
             estrategias = (
                 f"A aula será desenvolvida de forma dialogada e orientada, com apresentação progressiva dos conteúdos "
-                f"{conhecimentos_txt}. O docente realizará contextualização técnica, levantamento de conhecimentos prévios, "
-                f"explicação estruturada, análise de exemplos e leitura orientada. Os estudantes participarão por meio "
-                f"de interpretação de informações, resolução comentada de atividades e registros sistematizados, com foco "
-                f"no desenvolvimento das capacidades {capacidades_txt}."
+                f"{conhecimentos_txt}. O docente realizará contextualização técnica, explicação estruturada, análise de exemplos, "
+                f"questionamentos dirigidos e registros sistematizados, com foco no desenvolvimento das capacidades {capacidades_txt}."
             )
         else:
             estrategias = (
-                f"A aula será conduzida com foco na aplicação prática dos conteúdos {conhecimentos_txt}. Após breve "
-                f"retomada conceitual, haverá demonstração técnica do professor e execução orientada pelos estudantes, "
-                f"com uso de materiais, instrumentos e procedimentos compatíveis com a UC. O desenvolvimento priorizará "
-                f"as capacidades {capacidades_txt}, com acompanhamento contínuo, correção em processo e sistematização final."
+                f"A aula será conduzida com foco na aplicação prática dos conteúdos {conhecimentos_txt}. Após breve retomada "
+                f"conceitual, haverá demonstração técnica e execução orientada pelos estudantes, com acompanhamento contínuo e "
+                f"sistematização final, priorizando as capacidades {capacidades_txt}."
             )
 
-    if len(avaliacoes) < 140:
+    if len(avaliacoes) < 120:
         if tipo == "teorica":
             avaliacoes = (
                 f"A avaliação ocorrerá de forma processual, considerando a compreensão dos conteúdos {conhecimentos_txt}, "
-                f"a participação qualificada, a interpretação técnica, a coerência das respostas e a capacidade de "
-                f"relacionar teoria e aplicação. Também serão observados indícios de desenvolvimento das capacidades "
-                f"{capacidades_txt} durante as atividades propostas."
+                f"a participação qualificada, a interpretação técnica e o desenvolvimento das capacidades {capacidades_txt}."
             )
         else:
             avaliacoes = (
                 f"A avaliação ocorrerá por observação da execução prática, considerando a aplicação correta dos conteúdos "
-                f"{conhecimentos_txt}, a precisão técnica, a organização do processo, a autonomia, a interpretação da "
-                f"proposta e a qualidade do resultado final. Serão observadas ainda as capacidades {capacidades_txt}."
+                f"{conhecimentos_txt}, a precisão técnica, a organização do processo e o desenvolvimento das capacidades {capacidades_txt}."
             )
 
     aula["estrategias"] = estrategias
     aula["avaliacoes"] = avaliacoes
     return aula
 
-def complementar_aula(aula: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        complemento = gerar_texto_pedagogico_aula(aula)
-        aula["capacidades"] = complemento["capacidades"]
-        aula["estrategias"] = complemento["estrategias"]
-        aula["avaliacoes"] = complemento["avaliacoes"]
-    except Exception:
-        aula["capacidades"] = [
+def gerar_aulas_com_fallback_local(aulas_base: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    aulas = []
+    for aula in aulas_base:
+        aula_local = dict(aula)
+        aula_local["capacidades"] = [
             "Compreender os conteúdos propostos",
             "Relacionar fundamentos e aplicação técnica",
             "Aplicar os conhecimentos desenvolvidos na aula"
         ]
-        aula["estrategias"] = ""
-        aula["avaliacoes"] = ""
-
-    return enriquecer_campos_aula(aula)
+        aula_local["estrategias"] = ""
+        aula_local["avaliacoes"] = ""
+        aulas.append(enriquecer_campos_aula(aula_local))
+    return aulas
 
 # ==========================================
 # EXCEL
@@ -781,9 +882,16 @@ def processar_arquivos(pdf_bytes: bytes, excel_bytes: bytes) -> Dict[str, Any]:
         texto_extraido, logs_texto, metodo_texto = extrair_texto_pdf(caminho_pdf)
         debug = list(logs_texto)
 
-        conhecimentos_lista, debug_conhecimentos = extrair_coluna_conhecimentos(caminho_pdf)
-        debug.extend(debug_conhecimentos)
-        debug.append("Conhecimentos extraídos por coordenadas/pdfplumber.")
+        conhecimentos_lista = []
+        try:
+            conhecimentos_lista, debug_conhecimentos = extrair_coluna_conhecimentos(caminho_pdf)
+            debug.extend(debug_conhecimentos)
+            debug.append("Conhecimentos extraídos por coordenadas/pdfplumber.")
+        except Exception as e:
+            debug.append(f"Falha na extração por coordenadas: {e}")
+            conhecimentos_lista, debug_texto = extrair_conhecimentos_do_texto(texto_extraido)
+            debug.extend(debug_texto)
+            debug.append("Conhecimentos extraídos por texto/OCR.")
 
         if not conhecimentos_lista:
             raise ValueError("Nenhum tópico foi extraído da coluna 'Conhecimentos'.")
@@ -792,7 +900,15 @@ def processar_arquivos(pdf_bytes: bytes, excel_bytes: bytes) -> Dict[str, Any]:
         numero_aulas = calcular_numero_aulas(carga_horaria, HORAS_POR_AULA)
 
         aulas_base = montar_aulas_base(conhecimentos_lista, numero_aulas)
-        aulas_estruturadas = [complementar_aula(aula) for aula in aulas_base]
+
+        try:
+            aulas_estruturadas = gerar_textos_pedagogicos_em_lote(aulas_base)
+            aulas_estruturadas = [enriquecer_campos_aula(aula) for aula in aulas_estruturadas]
+            debug.append("Textos pedagógicos gerados em lote com IA.")
+        except Exception as e:
+            debug.append(f"Falha na geração em lote com IA: {e}")
+            aulas_estruturadas = gerar_aulas_com_fallback_local(aulas_base)
+            debug.append("Fallback local aplicado para geração pedagógica.")
 
         arquivo_saida = preencher_excel_em_memoria(
             dados_aulas=aulas_estruturadas,
@@ -823,6 +939,14 @@ st.set_page_config(page_title="Gerador de PER Online", layout="wide")
 
 st.title("📘 Gerador de PER Online")
 st.write("Envie o PDF da UC e o arquivo PER em branco para gerar o PER preenchido.")
+
+with st.expander("ℹ️ Informações"):
+    st.write("""
+- O sistema tenta primeiro extrair o texto com pdfplumber.
+- Se falhar, usa OCR.
+- A geração pedagógica foi otimizada para usar uma chamada em lote à IA.
+- Se a IA falhar, o sistema usa textos locais padrão para não interromper o processo.
+""")
 
 pdf_file = st.file_uploader("Envie o arquivo UC - PDF", type=["pdf"])
 excel_file = st.file_uploader("Envie o arquivo PER em branco", type=["xlsx"])
