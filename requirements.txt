@@ -3,3 +3,6 @@ pdfplumber
 openpyxl
 python-dotenv
 groq
+pdf2image
+pytesseract
+pillow
